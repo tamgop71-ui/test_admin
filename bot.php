@@ -20,7 +20,7 @@ $db->exec('CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY AUTOINCREM
 $db->exec('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
 $adminIds = array_filter(array_map('intval', explode(',', (string)getenv('OWNER_IDS'))));
 
-function vk(string $method, array $params = []): array {
+function vk(string $method, array $params = []): mixed {
     global $token;
     $params['access_token'] = $token;
     $params['v'] = API_VERSION;
@@ -37,6 +37,9 @@ function keyboard(array $rows, bool $inline = false): string {
     return json_encode(['one_time'=>false,'inline'=>$inline,'buttons'=>$rows], JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
 }
 function btn(string $label, string $payload, string $color='primary'): array {
+    // VK limits button labels to 40 characters. Keep a little margin for Unicode labels.
+    $chars = preg_split('//u', $label, -1, PREG_SPLIT_NO_EMPTY);
+    if (is_array($chars) && count($chars) > 40) $label = implode('', array_slice($chars, 0, 37)) . '…';
     return ['action'=>['type'=>'text','label'=>$label,'payload'=>json_encode(['cmd'=>$payload], JSON_UNESCAPED_UNICODE)],'color'=>$color];
 }
 function sendMsg(int $peerId, string $message, ?string $keyboard = null): void {
@@ -134,7 +137,17 @@ function handle(PDO $db, int $peer, int $uid, string $text, ?array $payload, arr
 }
 
 echo "RAZE Admin Exam Bot started. Questions: ".count($questions).PHP_EOL;
-$lp = vk('groups.getLongPollServer',['group_id'=>$groupId]);
+try {
+    $lp = vk('groups.getLongPollServer',['group_id'=>$groupId]);
+} catch (Throwable $e) {
+    fwrite(STDERR, "Не удалось получить Long Poll сервер VK: ".$e->getMessage()."\n");
+    fwrite(STDERR, "Включи Long Poll API в настройках сообщества VK и активируй событие message_new.\n");
+    exit(1);
+}
+if (!is_array($lp) || empty($lp['server']) || empty($lp['key']) || !isset($lp['ts'])) {
+    fwrite(STDERR, "VK вернул некорректные параметры Long Poll. Проверь VK_GROUP_ID и настройки Long Poll сообщества.\n");
+    exit(1);
+}
 $server=$lp['server']; $key=$lp['key']; $ts=(string)$lp['ts'];
 while (true) {
     $url=$server.'?'.http_build_query(['act'=>'wait','key'=>$key,'ts'=>$ts,'wait'=>25,'mode'=>2]);
@@ -145,7 +158,7 @@ while (true) {
     if (!is_array($data)) { sleep(1); continue; }
     if (isset($data['failed'])) {
         if ((int)$data['failed']===1) $ts=(string)($data['ts'] ?? $ts);
-        else { $lp=vk('groups.getLongPollServer',['group_id'=>$groupId]); $server=$lp['server'];$key=$lp['key'];$ts=(string)$lp['ts']; }
+        else { $lp=vk('groups.getLongPollServer',['group_id'=>$groupId]); if (!is_array($lp) || empty($lp['server']) || empty($lp['key']) || !isset($lp['ts'])) { error_log('VK returned invalid Long Poll settings after failed event.'); sleep(2); continue; } $server=$lp['server'];$key=$lp['key'];$ts=(string)$lp['ts']; }
         continue;
     }
     $ts=(string)($data['ts'] ?? $ts);
