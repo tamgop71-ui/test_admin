@@ -15,7 +15,14 @@ if ($token === '' || $groupId <= 0) {
 if (!is_dir(dirname($dbPath))) mkdir(dirname($dbPath), 0775, true);
 $db = new PDO('sqlite:' . $dbPath, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
 $db->exec('PRAGMA journal_mode=WAL');
-$db->exec('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, q_index INTEGER NOT NULL DEFAULT 0, correct INTEGER NOT NULL DEFAULT 0, answered INTEGER NOT NULL DEFAULT 0, mode TEXT NOT NULL DEFAULT "learn", active INTEGER NOT NULL DEFAULT 0, wrong_json TEXT NOT NULL DEFAULT "[]", updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)');
+$db->exec('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, q_index INTEGER NOT NULL DEFAULT 0, correct INTEGER NOT NULL DEFAULT 0, answered INTEGER NOT NULL DEFAULT 0, mode TEXT NOT NULL DEFAULT "learn", active INTEGER NOT NULL DEFAULT 0, wrong_json TEXT NOT NULL DEFAULT "[]", question_count INTEGER NOT NULL DEFAULT 10, question_order_json TEXT NOT NULL DEFAULT "[]", pending_mode TEXT NOT NULL DEFAULT "", updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)');
+foreach ([
+    'question_count INTEGER NOT NULL DEFAULT 10',
+    'question_order_json TEXT NOT NULL DEFAULT "[]"',
+    'pending_mode TEXT NOT NULL DEFAULT ""'
+] as $column) {
+    try { $db->exec('ALTER TABLE users ADD COLUMN ' . $column); } catch (PDOException $ignored) {}
+}
 $db->exec('CREATE TABLE IF NOT EXISTS results (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, correct INTEGER NOT NULL, answered INTEGER NOT NULL, percent INTEGER NOT NULL, finished_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)');
 $db->exec('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
 $adminIds = array_filter(array_map('intval', explode(',', (string)getenv('OWNER_IDS'))));
@@ -56,8 +63,8 @@ function getUser(PDO $db, int $uid): array {
     return $u;
 }
 function saveUser(PDO $db, int $uid, array $u): void {
-    $s=$db->prepare('UPDATE users SET q_index=?,correct=?,answered=?,mode=?,active=?,wrong_json=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=?');
-    $s->execute([(int)$u['q_index'],(int)$u['correct'],(int)$u['answered'],(string)$u['mode'],(int)$u['active'],(string)$u['wrong_json'],$uid]);
+    $s=$db->prepare('UPDATE users SET q_index=?,correct=?,answered=?,mode=?,active=?,wrong_json=?,question_count=?,question_order_json=?,pending_mode=?,updated_at=CURRENT_TIMESTAMP WHERE user_id=?');
+    $s->execute([(int)$u['q_index'],(int)$u['correct'],(int)$u['answered'],(string)$u['mode'],(int)$u['active'],(string)$u['wrong_json'],(int)($u['question_count'] ?? 10),(string)($u['question_order_json'] ?? '[]'),(string)($u['pending_mode'] ?? ''),$uid]);
 }
 function shuffledQuestion(array $q): array {
     // Keep answer indices stable; options are intentionally not shuffled in this starter version.
@@ -65,7 +72,7 @@ function shuffledQuestion(array $q): array {
 }
 function showQuestion(PDO $db, int $peer, int $uid, array $u, array $questions, bool $review=false): void {
     $wrong = json_decode($u['wrong_json'] ?: '[]', true) ?: [];
-    $pool = $review ? $wrong : range(0, max(0,count($questions)-1));
+    $pool = $review ? $wrong : (json_decode((string)($u['question_order_json'] ?? '[]'), true) ?: range(0, max(0,count($questions)-1)));
     if (!$pool || (int)$u['q_index'] >= count($pool) || !$questions) {
         $answered=(int)$u['answered']; $correct=(int)$u['correct']; $pct=$answered ? (int)round($correct*100/$answered) : 0;
         $db->prepare('INSERT INTO results(user_id,correct,answered,percent) VALUES(?,?,?,?)')->execute([$uid,$correct,$answered,$pct]);
@@ -83,9 +90,35 @@ function showQuestion(PDO $db, int $peer, int $uid, array $u, array $questions, 
     $num=(int)$u['q_index']+1;
     sendMsg($peer,"🧠 {$modeLabel}\nВопрос {$num} из ".count($pool)."\nТема: {$q['category']}\n\n".$q['q'],keyboard($rows,true));
 }
-function startMode(PDO $db, int $peer, int $uid, array $u, string $mode, array $questions): void {
+function countKeyboard(string $mode, int $available): string {
+    $counts = [5,10,15,20,25,30,40,50];
+    $rows = [];
+    $row = [];
+    foreach ($counts as $n) {
+        if ($n <= $available) $row[] = btn((string)$n . ' вопросов', 'count_' . $mode . '_' . $n, 'primary');
+        if (count($row) === 2) { $rows[] = $row; $row = []; }
+    }
+    if ($available > 0) $row[] = btn('Все (' . $available . ')', 'count_' . $mode . '_all', 'positive');
+    if ($row) $rows[] = $row;
+    $rows[] = [btn('↩️ Назад в меню', 'menu', 'secondary')];
+    return keyboard($rows);
+}
+function startMode(PDO $db, int $peer, int $uid, array $u, string $mode, array $questions, ?int $requestedCount = null): void {
     $u['q_index']=0; $u['correct']=0; $u['answered']=0; $u['mode']=$mode; $u['active']=1;
-    if ($mode !== 'review') $u['wrong_json']='[]';
+    if ($mode !== 'review') {
+        $u['wrong_json']='[]';
+        $indices = range(0, max(0, count($questions)-1));
+        if (!$questions) $indices = [];
+        shuffle($indices);
+        $count = min(count($indices), max(1, $requestedCount ?? 10));
+        $indices = array_slice($indices, 0, $count);
+        $u['question_count'] = count($indices);
+        $u['question_order_json'] = json_encode($indices);
+    } else {
+        $wrong = json_decode($u['wrong_json'] ?: '[]', true) ?: [];
+        $u['question_order_json'] = json_encode($wrong);
+        $u['question_count'] = count($wrong);
+    }
     saveUser($db,$uid,$u);
     showQuestion($db,$peer,$uid,$u,$questions,$mode==='review');
 }
@@ -99,7 +132,16 @@ function handle(PDO $db, int $peer, int $uid, string $text, ?array $payload, arr
         sendMsg($peer,"Привет! Я бот для подготовки к посту администратора.\n\nНажимай кнопки ниже:\n• Обучение — вопросы с пояснениями\n• Экзамен — проверка знаний\n• Повторить ошибки — вопросы, на которые ты ответил неправильно\n• Мой результат — статистика\n\nОтветы выбираются кнопками. После каждого ответа я покажу правильный вариант и пояснение.",mainKeyboard()); return;
     }
     if ($cmd==='menu') { sendMsg($peer,'Главное меню:',mainKeyboard()); return; }
-    if ($cmd==='mode_learn' || $cmd==='mode_exam') { startMode($db,$peer,$uid,$u,$cmd==='mode_exam'?'exam':'learn',$questions); return; }
+    if ($cmd==='mode_learn' || $cmd==='mode_exam') {
+        $mode = $cmd === 'mode_exam' ? 'exam' : 'learn';
+        $u['pending_mode'] = $mode; saveUser($db,$uid,$u);
+        sendMsg($peer,'Сколько вопросов будет в '.($mode==='exam'?'экзамене':'обучении').'? Всего доступно: '.count($questions).'.',countKeyboard($mode,count($questions))); return;
+    }
+    if (preg_match('/^count_(learn|exam)_(all|\\d+)$/', $cmd, $cm)) {
+        $count = $cm[2] === 'all' ? count($questions) : (int)$cm[2];
+        if ($count < 1 || !$questions) { sendMsg($peer,'В questions.json пока нет вопросов.',mainKeyboard()); return; }
+        startMode($db,$peer,$uid,$u,$cm[1],$questions,$count); return;
+    }
     if ($cmd==='mode_review') {
         $wrong=json_decode($u['wrong_json'] ?: '[]',true) ?: [];
         if (!$wrong) { sendMsg($peer,'Пока нет ошибок для повторения. Пройди обучение или экзамен сначала.',mainKeyboard()); return; }
